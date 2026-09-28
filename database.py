@@ -17,6 +17,8 @@ EXCEL_PATH = DATA_DIR / "Combined_Flight_Data.xlsx"
 
 EXCEL_SHEET = "airfare_dataset_SAMPLE"
 
+DGCA_CSV_PATH = DATA_DIR / "dgca_weighted_airfare_index_100_rows.csv"
+
 
 # =========================================================
 # DATABASE CONNECTION
@@ -49,11 +51,84 @@ def ensure_route_weights_table():
         conn.commit()
 
 def load_route_weights():
+
     ensure_route_weights_table()
+
+    # -----------------------------------------------------
+    # CHECK WHETHER ROUTE WEIGHTS ALREADY EXIST
+    # -----------------------------------------------------
+
     with get_connection() as conn:
+
+        count = conn.execute(
+            "SELECT COUNT(*) FROM route_weights"
+        ).fetchone()[0]
+
+    # -----------------------------------------------------
+    # IF EMPTY, LOAD DGCA CSV
+    # -----------------------------------------------------
+
+    if count == 0:
+
+        dgca_df = load_dgca_data()
+
+        if not dgca_df.empty:
+
+            route_weights = (
+                dgca_df[
+                    [
+                        "Route_Code",
+                        "Capacity_Weight"
+                    ]
+                ]
+                .drop_duplicates(
+                    subset=["Route_Code"]
+                )
+                .copy()
+            )
+
+            route_weights = route_weights.rename(
+                columns={
+                    "Route_Code": "route",
+                    "Capacity_Weight":
+                        "passenger_percentage",
+                }
+            )
+
+            route_weights["source"] = (
+                "DGCA weighted airfare dataset"
+            )
+
+            route_weights["reference_period"] = (
+                dgca_df["Date"]
+                .min()
+                .strftime("%Y-%m-%d")
+            )
+
+            # IMPORTANT:
+            # We are not claiming this CSV itself is
+            # officially verified DGCA source data.
+            route_weights["official"] = 0
+
+            upsert_route_weights(route_weights)
+
+    # -----------------------------------------------------
+    # RETURN ROUTE WEIGHTS
+    # -----------------------------------------------------
+
+    with get_connection() as conn:
+
         return pd.read_sql_query(
-            "SELECT route, passenger_percentage, source, reference_period, official "
-            "FROM route_weights ORDER BY passenger_percentage DESC",
+            """
+            SELECT
+                route,
+                passenger_percentage,
+                source,
+                reference_period,
+                official
+            FROM route_weights
+            ORDER BY passenger_percentage DESC
+            """,
             conn,
         )
 
@@ -235,3 +310,113 @@ def load_airfare_excel():
     ]
 
     return records.reset_index(drop=True)
+
+
+# =========================================================
+# LOAD DGCA WEIGHTED AIRFARE DATA
+# =========================================================
+
+def load_dgca_data():
+
+    if not DGCA_CSV_PATH.exists():
+        raise FileNotFoundError(
+            f"DGCA CSV file not found:\n{DGCA_CSV_PATH}"
+        )
+
+    df = pd.read_csv(DGCA_CSV_PATH)
+
+    required_columns = [
+        "Date",
+        "Route_Code",
+        "Origin",
+        "Destination",
+        "Capacity_Weight",
+        "Base_Price_INR",
+        "Observed_Price_INR",
+        "Price_Ratio",
+        "Weighted_Contribution",
+        "Index_Type",
+    ]
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "Missing DGCA columns: "
+            f"{missing_columns}"
+        )
+
+    # -----------------------------------------------------
+    # DATE
+    # -----------------------------------------------------
+
+    df["Date"] = pd.to_datetime(
+        df["Date"],
+        errors="coerce"
+    )
+
+    # -----------------------------------------------------
+    # NUMERIC COLUMNS
+    # -----------------------------------------------------
+
+    numeric_columns = [
+        "Capacity_Weight",
+        "Base_Price_INR",
+        "Observed_Price_INR",
+        "Price_Ratio",
+        "Weighted_Contribution",
+    ]
+
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
+
+    # -----------------------------------------------------
+    # REMOVE INVALID RECORDS
+    # -----------------------------------------------------
+
+    df = df.dropna(
+        subset=[
+            "Date",
+            "Route_Code",
+            "Capacity_Weight",
+            "Base_Price_INR",
+            "Observed_Price_INR",
+            "Price_Ratio",
+            "Weighted_Contribution",
+        ]
+    )
+
+    return df.reset_index(drop=True)
+
+# =========================================================
+# LOAD DGCA INDEX DATA
+# =========================================================
+
+def load_dgca_index_data():
+
+    df = load_dgca_data()
+
+    if df.empty:
+        return df
+
+    return df[
+        [
+            "Date",
+            "Route_Code",
+            "Origin",
+            "Destination",
+            "Capacity_Weight",
+            "Base_Price_INR",
+            "Observed_Price_INR",
+            "Price_Ratio",
+            "Weighted_Contribution",
+            "Index_Type",
+        ]
+    ].copy()
